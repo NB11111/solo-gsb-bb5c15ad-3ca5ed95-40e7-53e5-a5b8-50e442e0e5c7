@@ -5724,3 +5724,322 @@ def test_legacy_database_supports_enrollment_locks_after_migration(
         again = acquire_locks(migrated, "legacy-enr", ["s1"], "enr-legacy-2")
         assert again.status_code == 201
         assert again.json()["reservation_id"] != body["reservation_id"]
+
+
+# ---------- 换号与入组锁的状态一致性 ----------
+
+
+def _occupancy(client: TestClient, *subject_ids: str) -> dict[str, dict]:
+    resp = client.get(
+        "/enrollment-locks",
+        params=[("subject_ids", s) for s in subject_ids],
+    )
+    assert resp.status_code == 200, resp.text
+    return {s["subject_id"]: s for s in resp.json()["subjects"]}
+
+
+def _db_rows(db_path, sql: str, params=()):
+    with sqlite3.connect(db_path) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def test_replace_rejected_when_original_subject_enrollment_locked(
+    tmp_path, monkeypatch
+) -> None:
+    """原编号被任意有效 reservation 占用时换号 409 且零写入。
+
+    占用方就是本实验自身的租约也不例外：必须先释放锁再换号。
+    """
+    db_path = tmp_path / "replace-lock-original.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    with TestClient(app) as local:
+        body, _ = create_experiment(
+            local, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+        )
+        eid = body["experiment_id"]
+
+        held = acquire_locks(local, eid, ["s1", "s9"], "enr-orig")
+        assert held.status_code == 201, held.text
+        held_body = held.json()
+
+        # 原编号 s1 被本实验自己的有效 reservation 占用 → 409
+        resp = replace_subject(local, eid, "s1", "s1-new", "rep-locked-1")
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "enrollment_lock_conflict"
+        assert detail["operation_id"] == "rep-locked-1"
+        assert detail["conflicts"] == [
+            {
+                "subject_id": "s1",
+                "role": "original",
+                "experiment_id": eid,
+                "reservation_id": held_body["reservation_id"],
+                "version": 1,
+            }
+        ]
+        assert_no_sequence_leak(detail)
+
+        # 零写入 / 无副作用：锁不变、分配不转移、无墓碑与审计
+        assert _occupancy(local, "s1", "s1-new")["s1"]["reservation_id"] == (
+            held_body["reservation_id"]
+        )
+        assert _occupancy(local, "s1", "s1-new")["s1-new"]["status"] == "released"
+        roster = local.get(f"/experiments/{eid}").json()
+        assert [a["subject_id"] for a in roster["assignments"]] == ["s1", "s2"]
+        events = local.get(f"/experiments/{eid}/subject-replacements").json()
+        assert events["replacements"] == []
+        # reservation 受试者清单未被暗改
+        subjects = _db_rows(
+            db_path,
+            "SELECT subjects FROM enrollment_reservations WHERE reservation_id = ?",
+            (held_body["reservation_id"],),
+        )[0][0]
+        assert json.loads(subjects) == ["s1", "s9"]
+
+        # 冲突不消耗 operation_id：换参数（此处原因不同）仍会被占用门禁拒绝，
+        # 释放锁后用同一个 operation_id 首次成功
+        still = replace_subject(
+            local, eid, "s1", "s1-new", "rep-locked-1", "其他换号原因"
+        )
+        assert still.status_code == 409
+        assert still.json()["detail"]["reason"] == "enrollment_lock_conflict"
+
+        assert (
+            release_locks(
+                local, eid, held_body["reservation_id"], 1, "rel-orig"
+            ).status_code
+            == 200
+        )
+        ok = replace_subject(local, eid, "s1", "s1-new", "rep-locked-1")
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["original_subject_id"] == "s1"
+
+        # 换号不改锁：旧编号占用随释放已删除，新编号从未登记，故无占用
+        occ = _occupancy(local, "s1", "s1-new")
+        assert occ["s1"]["status"] == "released"
+        assert occ["s1-new"]["status"] == "released"
+
+
+def test_replace_rejected_when_replacement_subject_enrollment_locked(
+    client: TestClient,
+) -> None:
+    """新编号被其他实验的有效 reservation 占用时换号 409 且零写入。
+
+    这是修复前会导致“同一受试者跨实验重复入组”的路径：旧编号仍挂着
+    e1 的锁（且换号会继续占用），新编号却可被 e2 申请。
+    """
+    # e1 名册使用 s1/s2；e2 是另一个实验，对 s1-new 持有有效入组锁
+    e1 = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["s1", "s2"],
+        seed=5,
+    )[0]["experiment_id"]
+    e2 = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["t1", "t2"],
+        seed=6,
+    )[0]["experiment_id"]
+    held = acquire_locks(client, e2, ["s1-new", "s9"], "enr-e2-new")
+    assert held.status_code == 201, held.text
+    held_body = held.json()
+
+    resp = replace_subject(client, e1, "s1", "s1-new", "rep-new-locked")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "enrollment_lock_conflict"
+    assert detail["operation_id"] == "rep-new-locked"
+    assert detail["conflicts"] == [
+        {
+            "subject_id": "s1-new",
+            "role": "replacement",
+            "experiment_id": e2,
+            "reservation_id": held_body["reservation_id"],
+            "version": 1,
+        }
+    ]
+    assert_no_sequence_leak(detail)
+
+    # 零写入 / 无副作用：分配仍在旧编号、无墓碑审计
+    roster = client.get(f"/experiments/{e1}").json()
+    assert [a["subject_id"] for a in roster["assignments"]] == ["s1", "s2"]
+    assert (
+        client.get(f"/experiments/{e1}/subjects/s1/progress").json()["next_period"]
+        == 1
+    )
+    assert client.get(f"/experiments/{e1}/subject-replacements").json()[
+        "replacements"
+    ] == []
+
+    # e2 的锁与 reservation 原封不动（受试者清单未被暗改）
+    occ = _occupancy(client, "s1", "s1-new")
+    assert occ["s1"]["status"] == "released"
+    assert occ["s1-new"]["experiment_id"] == e2
+    assert occ["s1-new"]["reservation_id"] == held_body["reservation_id"]
+    locks = client.get(f"/experiments/{e2}/enrollment-locks").json()
+    assert {s["subject_id"] for s in locks["subjects"]} == {"s1-new", "s9"}
+
+    # 修复前的重入组漏洞被堵死：释放 e2 锁前，e2 不能再申请到 s1
+    # （s1 本身从未被任何锁登记，真正的漏洞是换号后 s1-new 的双重占用，
+    # 这里直接验证占用门禁拦截）。冲突不消耗 operation_id。
+    retry_same = replace_subject(client, e1, "s1", "s1-new", "rep-new-locked")
+    assert retry_same.status_code == 409
+    assert retry_same.json()["detail"]["reason"] == "enrollment_lock_conflict"
+
+    # 释放新编号上的锁后换号成功；此后新编号在 e2 重新入组时会与名册一致，
+    # 不存在跨实验重复入组
+    assert (
+        release_locks(
+            client, e2, held_body["reservation_id"], 1, "rel-e2-new"
+        ).status_code
+        == 200
+    )
+    ok = replace_subject(client, e1, "s1", "s1-new", "rep-new-locked")
+    assert ok.status_code == 200, ok.text
+
+    # 换号成功后：旧编号退役、锁表无旧编号
+    assert _occupancy(client, "s1", "s1-new")["s1"]["status"] == "released"
+
+    # e2 先对新编号重新入组：此后同一全局键上，e1（或 e2 的另一
+    # reservation）再申请都必须冲突——修复后不存在同一受试者跨实验重复入组
+    reacquire = acquire_locks(client, e2, ["s1-new"], "enr-e2-after")
+    assert reacquire.status_code == 201, reacquire.text
+    e1_competes = acquire_locks(client, e1, ["s1-new"], "enr-e1-after")
+    assert e1_competes.status_code == 409
+    assert e1_competes.json()["detail"]["reason"] == "subjects_occupied"
+    e2_dup = acquire_locks(client, e2, ["s1-new"], "enr-e2-dup")
+    assert e2_dup.status_code == 409
+    assert e2_dup.json()["detail"]["reason"] == "subjects_occupied"
+
+    # e2 释放后，e1 才能对新编号入组；旧 reservation 不复活
+    assert (
+        release_locks(
+            client, e2, reacquire.json()["reservation_id"], 1, "rel-e2-after"
+        ).status_code
+        == 200
+    )
+    self_lock = acquire_locks(client, e1, ["s1-new"], "enr-e1-wins")
+    assert self_lock.status_code == 201, self_lock.text
+
+
+def test_replace_after_release_replays_first_result_and_keeps_reservations(
+    tmp_path, monkeypatch
+) -> None:
+    """释放相关锁后换号成功；成功后的同参数重试回放首次结果。
+
+    另验证：换号过程不暗改任何 reservation 的受试者清单（释放前后均如此）。
+    """
+    db_path = tmp_path / "replace-release-replay.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    with TestClient(app) as local:
+        body, _ = create_experiment(
+            local, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+        )
+        eid = body["experiment_id"]
+
+        held = acquire_locks(local, eid, ["s1", "s9"], "enr-rr")
+        assert held.status_code == 201
+        reservation_id = held.json()["reservation_id"]
+
+        # 持锁时换号被拒
+        blocked = replace_subject(local, eid, "s1", "s1-new", "rep-rr")
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["reason"] == "enrollment_lock_conflict"
+
+        # 释放后换号成功（入组申请 / 释放接口语义保持不变）
+        released = release_locks(local, eid, reservation_id, 1, "rel-rr")
+        assert released.status_code == 200
+        assert released.json()["status"] == "released"
+
+        first = replace_subject(local, eid, "s1", "s1-new", "rep-rr", "录入错误")
+        assert first.status_code == 200, first.text
+        first_body = first.json()
+
+        # 已成功换号的同参数重试仍回放首次结果（同一审计、同一时间戳）
+        for _ in range(2):
+            replay = replace_subject(
+                local, eid, "s1", "s1-new", "rep-rr", "录入错误"
+            )
+            assert replay.status_code == 200
+            assert replay.json() == first_body
+        events = local.get(f"/experiments/{eid}/subject-replacements").json()
+        assert len(events["replacements"]) == 1
+
+        # 换号前后 reservation 的受试者清单从未被暗改
+        rows = _db_rows(
+            db_path,
+            "SELECT subjects, status, version FROM enrollment_reservations "
+            "ORDER BY created_at",
+        )
+        assert [json.loads(r[0]) for r in rows] == [["s1", "s9"]]
+        assert [(r[1], r[2]) for r in rows] == [("released", 2)]
+        # 锁表：换号不重挂旧编号，新编号未被换号自动占用
+        assert _db_rows(db_path, "SELECT subject_id FROM enrollment_locks") == []
+
+        # 原编号墓碑语义不变，新编号承接分配
+        assert (
+            local.get(f"/experiments/{eid}/subjects/s1/progress").status_code
+            == 409
+        )
+        progress = local.get(f"/experiments/{eid}/subjects/s1-new/progress")
+        assert progress.status_code == 200
+        assert progress.json()["next_period"] == 1
+
+
+def test_replace_lock_conflict_reports_both_original_and_replacement(
+    tmp_path, monkeypatch
+) -> None:
+    """原 / 新编号分别被不同有效 reservation 占用时一次性列出全部冲突。"""
+    db_path = tmp_path / "replace-lock-both.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+    with TestClient(app) as local:
+        body, _ = create_experiment(
+            local, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+        )
+        e1 = body["experiment_id"]
+        e2 = create_experiment(
+            local, conditions=["A", "B"], subject_ids=["t1", "t2"], seed=6
+        )[0]["experiment_id"]
+
+        own = acquire_locks(local, e1, ["s1"], "enr-both-own")
+        assert own.status_code == 201
+        other = acquire_locks(local, e2, ["s1-new"], "enr-both-other")
+        assert other.status_code == 201
+
+        resp = replace_subject(local, e1, "s1", "s1-new", "rep-both")
+        assert resp.status_code == 409
+        conflicts = resp.json()["detail"]["conflicts"]
+        # 原编号在前、新编号在后
+        assert [(c["role"], c["subject_id"]) for c in conflicts] == [
+            ("original", "s1"),
+            ("replacement", "s1-new"),
+        ]
+        by_role = {c["role"]: c for c in conflicts}
+        assert by_role["original"]["reservation_id"] == own.json()["reservation_id"]
+        assert by_role["original"]["experiment_id"] == e1
+        assert by_role["replacement"]["reservation_id"] == other.json()[
+            "reservation_id"
+        ]
+        assert by_role["replacement"]["experiment_id"] == e2
+
+        # 零写入：无墓碑 / 审计、两边的锁均保持原状
+        assert local.get(f"/experiments/{e1}/subject-replacements").json()[
+            "replacements"
+        ] == []
+        occ = _occupancy(local, "s1", "s1-new")
+        assert occ["s1"]["experiment_id"] == e1
+        assert occ["s1-new"]["experiment_id"] == e2
+
+        # 只释放其中一边仍 409（冲突列表只剩未释放的一边）
+        assert (
+            release_locks(local, e1, own.json()["reservation_id"], 1, "rel-both-1").status_code
+            == 200
+        )
+        one_left = replace_subject(local, e1, "s1", "s1-new", "rep-both")
+        assert one_left.status_code == 409
+        assert [c["subject_id"] for c in one_left.json()["detail"]["conflicts"]] == [
+            "s1-new"
+        ]
+        occ_now = _occupancy(local, "s1")
+        assert occ_now["s1"]["status"] == "released"

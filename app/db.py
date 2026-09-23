@@ -51,6 +51,10 @@
   换号在单个 ``BEGIN IMMEDIATE`` 事务内把 ``assignments`` 的隐藏分配
   （序列内容及下标不变）与 ``subject_progress`` 进度原子改挂到新编号，
   仅允许原编号从未发生过任何揭盲（按周期揭盲或完成紧急揭盲）时操作。
+  换号写事务在改挂前还以 ``subject_id`` 全局键校验入组占用：原编号或新编号
+  被任意有效（held）reservation 占用（含本实验自己的租约）时整事务回滚，
+  返回冲突并要求先释放相关锁；换号绝不暗改 reservation 的受试者清单，
+  冲突时不产生墓碑 / 审计、不动锁与分配，也不消耗 operation_id。
 * ``enrollment_reservations`` / ``enrollment_locks`` /
   ``enrollment_lock_events``：受试者入组互斥模块。以 ``subject_id`` 为
   **全局键**（跨实验）登记 experiment enrollment lease：
@@ -434,6 +438,24 @@ class ReplacementOperationIdConflictError(Exception):
 
     冲突路径不携带任何条件 / 序列信息。
     """
+
+
+class ReplacementEnrollmentLockedError(Exception):
+    """换号的原编号或新编号正被某个有效（held）入组 reservation 占用。
+
+    换号不暗改任何 reservation 的受试者清单：必须先调用释放接口释放相关锁，
+    之后才能换号。
+
+    :param conflicts: 每个被占用编号一项，键为 ``subject_id``（``original`` /
+        ``replacement`` 中被占用的一方）与该编号当前的
+        ``experiment_id`` / ``reservation_id`` / ``version``。
+    """
+
+    def __init__(self, conflicts: list[dict[str, Any]]) -> None:
+        self.conflicts = conflicts
+        super().__init__(
+            f"replacement enrollment locked: {len(conflicts)} conflict(s)"
+        )
 
 
 class InvalidStateTransitionError(Exception):
@@ -2287,7 +2309,12 @@ def replace_subject(
     4. 揭盲检查：原编号必须从未发生过任何揭盲——无 ``unblindings``
        记录且无 ``unblinded`` 紧急揭盲审计，否则抛出
        :class:`SubjectAlreadyUnblindedError`；
-    5. 转移：``assignments`` 的隐藏分配（序列内容与 ``sequence_index``
+    5. 全局入组占用检查（跨实验）：以 ``subject_id`` 为全局键，原编号或新编号
+       当前被任意有效（held）reservation 占用（占用方可以是本实验，也可以是
+       其他实验）即汇总冲突并抛出 :class:`ReplacementEnrollmentLockedError`，
+       要求先释放相关锁再换号；本步骤只读不写，绝不暗改 reservation 的受试者
+       清单，锁状态在此处保持不变；
+    6. 转移：``assignments`` 的隐藏分配（序列内容与 ``sequence_index``
        保持不变）与 ``subject_progress`` 进度原子改挂到新编号，
        同事务写入原编号墓碑与换号审计记录，一起提交或一起回滚。
 
@@ -2391,7 +2418,38 @@ def _replace_subject_locked(
     if emergency_row is not None:
         raise SubjectAlreadyUnblindedError()
 
-    # 6) 原子转移：隐藏分配（序列与下标不变）与进度改挂到新编号
+    # 6) 全局入组占用门禁：原编号与新编号都不得被任何有效（held）reservation
+    #    占用。占用键是全局 subject_id（跨实验），即使锁属于本实验也必须先
+    #    释放再换号；此处只读校验，绝不修改 reservation 的受试者清单。
+    #    放在任何写操作之前，冲突时整批回滚：无墓碑 / 审计、锁与分配不变。
+    candidate_subjects = [subject_id, replacement_subject_id]
+    placeholders = ",".join("?" for _ in candidate_subjects)
+    occupied_rows = conn.execute(
+        f"SELECT subject_id, experiment_id, reservation_id, version "
+        f"FROM enrollment_locks WHERE subject_id IN ({placeholders})",
+        candidate_subjects,
+    ).fetchall()
+    if occupied_rows:
+        conflicts = [
+            {
+                "subject_id": row["subject_id"],
+                "role": (
+                    "original"
+                    if row["subject_id"] == subject_id
+                    else "replacement"
+                ),
+                "experiment_id": row["experiment_id"],
+                "reservation_id": row["reservation_id"],
+                "version": row["version"],
+            }
+            for row in occupied_rows
+        ]
+        # 原编号在前、新编号在后，保持稳定的冲突报告顺序
+        order = {subject_id: 0, replacement_subject_id: 1}
+        conflicts.sort(key=lambda c: (order[c["subject_id"]], c["subject_id"]))
+        raise ReplacementEnrollmentLockedError(conflicts)
+
+    # 7) 原子转移：隐藏分配（序列与下标不变）与进度改挂到新编号
     conn.execute(
         "UPDATE assignments SET subject_id = ? "
         "WHERE experiment_id = ? AND subject_id = ?",
@@ -2409,7 +2467,7 @@ def _replace_subject_locked(
         (replacement_subject_id, experiment_id, subject_id),
     )
 
-    # 7) 同事务落墓碑与审计（同一张表）：原编号自此退役
+    # 8) 同事务落墓碑与审计（同一张表）：原编号自此退役
     created_at = utc_now().isoformat()
     cursor = conn.execute(
         "INSERT INTO subject_replacements "
