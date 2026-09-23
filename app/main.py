@@ -16,6 +16,9 @@
 另提供受试者换号：仅允许原受试者从未揭盲时，在单个写事务内把隐藏分配
 （序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑不可复用、
 不可查询或推进，并追加不含条件内容的换号审计（按时间倒序分页查询）。
+换号不暗改入组 reservation：修改隐藏分配前先以 subject_id 为全局键校验
+原 / 新编号均未被任何有效 reservation 占用，任一被占即 409 且零写入，
+须先释放相关入组锁再换号。
 另提供实验模板克隆：POST /experiments/{id}/clone 基于源实验条件创建独立
 新实验，接收新的互异 subject_ids、seed 与可选 washout_seconds；克隆会
 重新生成 Williams 分配、稳定槽位与每周期盲态承诺，绝不复用源实验的
@@ -87,7 +90,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
@@ -846,9 +849,10 @@ def get_snapshot(experiment_id: str, snapshot_id: str) -> dict:
     "/experiments/{experiment_id}/subjects/{subject_id}/replace",
     response_model=SubjectReplacementEventOut,
     summary=(
-        "受试者换号：仅当原受试者从未揭盲时，在单个写事务内把隐藏分配"
-        "（序列内容与下标不变）与进度原子转移到新编号，原编号保留墓碑"
-        "（不可复用、不可查询进度或推进），并追加不含条件内容的审计记录"
+        "受试者换号：仅当原受试者从未揭盲、且原 / 新编号均未被有效入组锁"
+        "占用时，在单个写事务内把隐藏分配（序列内容与下标不变）与进度原子"
+        "转移到新编号，原编号保留墓碑（不可复用、不可查询进度或推进），"
+        "并追加不含条件内容的审计记录"
     ),
 )
 def replace_subject(
@@ -900,6 +904,20 @@ def replace_subject(
                 "message": "该受试者已发生揭盲，不允许换号",
                 "reason": "subject_already_unblinded",
                 "subject_id": subject_id,
+            },
+        )
+    except db.ReplacementEnrollmentOccupiedError as exc:
+        # 原编号或新编号被有效入组锁占用：先释放相关锁再换号，不暗改清单
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "原编号或新编号被有效入组 reservation 占用，"
+                    "请先释放相关入组锁再换号"
+                ),
+                "reason": "enrollment_occupied",
+                "operation_id": payload.operation_id,
+                "conflicts": exc.conflicts,
             },
         )
     if result is None:

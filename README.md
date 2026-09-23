@@ -184,10 +184,24 @@ JSON 快照**，之后的揭盲 / 完成 / 暂停均不影响已生成快照：
 - **原编号保留墓碑**：换号后原编号立即退役——不能作为新编号复用、不能再次
   换号、不能查询进度、不能推进 / 登记完成 / 发起紧急揭盲（单条与批量），
   这些操作对退役编号一律返回 `409 subject_replaced`；
+- **换号前必须先释放入组锁**：换号写事务在修改隐藏分配之前，先以
+  `subject_id` 为**全局键（跨实验）**校验**原编号与新编号都没有被任何有效
+  （held）入组 reservation 占用**。只要其中一个被占用（占用方可以是本实验
+  或其他实验的任意 reservation），即返回 `409 enrollment_occupied`，
+  `conflicts[]` 一次性列出每个被占用编号的 `subject_id` / `role`
+  （`original` / `replacement`）/ `experiment_id` / `reservation_id` /
+  `version`。服务**不会暗改任何 reservation 的受试者清单**，也不会替调用方
+  迁移锁：必须先调用
+  `POST /experiments/{id}/enrollment-release` 释放相关 reservation，再换号，
+  之后以新编号重新申请入组。这保证“持有入组锁的编号”与“实验内部分配编号”
+  始终指向同一受试者，不会出现旧编号仍挂着锁、新编号却能被其他实验申请而
+  导致同一受试者跨实验重复入组；
 - **冲突一律 `409` 且零写入**：新编号已存在（在册编号或已退役墓碑）返回
   `replacement_subject_exists`；原编号已揭盲返回 `subject_already_unblinded`；
-  并发换号由写事务串行化，只有第一个提交的事务成功，其余看到墓碑返回
-  `subject_replaced`——所有失败路径不写入任何数据、不消耗 `operation_id`；
+  原编号或新编号被有效入组锁占用返回 `enrollment_occupied`；并发换号由写事务
+  串行化，只有第一个提交的事务成功，其余看到墓碑返回 `subject_replaced`
+  ——所有失败路径不生成换号墓碑或审计、不改变任何锁与隐藏分配，也不消耗
+  `operation_id`（释放锁后用同一个 `operation_id` 重试即首次成功）；
 - **幂等**：相同 `(实验, operation_id)` 且原 / 新编号与原因完全相同的重试
   返回**首次结果**；同一 `operation_id` 绑定不同原 / 新编号或原因返回
   `409 operation_id_conflict`；
@@ -1038,10 +1052,18 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/subjects/s1/repla
 }
 ```
 
-冲突一律返回 `409` 且**零写入**（不消耗 `operation_id`），响应不揭露任何条件：
+冲突一律返回 `409` 且**零写入**（不生成墓碑 / 审计、不改变锁与分配，
+不消耗 `operation_id`），响应不揭露任何条件：
 
 - `replacement_subject_exists`：新编号已存在（在册编号或已退役墓碑）；
 - `subject_already_unblinded`：原受试者已发生过揭盲，不允许换号；
+- `enrollment_occupied`：原编号或新编号正被有效（held）入组 reservation
+  占用（占用方可以是本实验或其他实验），`conflicts[]` 列出每个被占用编号的
+  `subject_id` / `role`（`original` / `replacement`）/ `experiment_id` /
+  `reservation_id` / `version`。**必须先经
+  `POST /experiments/{id}/enrollment-release` 释放相关锁再换号**，
+  服务不会暗改 reservation 的受试者清单；释放后用**同一个 `operation_id`**
+  重试即首次成功；
 - `subject_replaced`：原编号已退役（墓碑），不能再次换号；并发换号只有
   第一个提交的事务成功，其余同样收到该原因；
 - `operation_id_conflict`：相同 `operation_id` 曾绑定不同的原 / 新编号或原因。
@@ -1276,7 +1298,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/enrollment-events?limit=
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、模板克隆、入组互斥 CAS 申请/释放/重入组、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、结果快照、受试者换号、换号与入组锁冲突/释放后换号、模板克隆、入组互斥 CAS 申请/释放/重入组、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -1375,9 +1397,12 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **受试者换号的原子性与墓碑语义**：换号在单个 `BEGIN IMMEDIATE` 写事务内
   完成“幂等检查 → 原编号在册且未退役校验 → 新编号未占用校验（在册与墓碑
   均不可复用）→ 原编号从未揭盲校验（`unblindings` 与紧急揭盲 `unblinded`
-  审计均无记录）→ `assignments` 隐藏分配（序列内容与 `sequence_index` 不变）
-  与 `subject_progress` 进度改挂新编号 → 写入原编号墓碑与换号审计 → 提交”。
-  并发换号被写事务串行化：只有第一个提交的事务成功，其余看到墓碑而
+  审计均无记录）→ **全局入组占用校验（原 / 新编号均不被任何 held
+  reservation 占用，跨实验）** → `assignments` 隐藏分配（序列内容与
+  `sequence_index` 不变）与 `subject_progress` 进度改挂新编号 → 写入原编号
+  墓碑与换号审计 → 提交”。入组校验先于一切写入，冲突时既不暗改
+  reservation 的受试者清单、也不改变锁与隐藏分配；调用方须先释放入组锁再
+  换号。并发换号被写事务串行化：只有第一个提交的事务成功，其余看到墓碑而
   `409 subject_replaced`；所有失败路径整体回滚、零写入、不消耗
   `operation_id`。墓碑检查同样内嵌在单条 / 批量推进、完成登记、进度查询与
   紧急揭盲的写事务（或查询）中，退役编号的一切后续操作一律

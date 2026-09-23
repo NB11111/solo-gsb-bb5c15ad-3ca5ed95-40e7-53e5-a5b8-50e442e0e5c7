@@ -478,7 +478,11 @@ class SubjectReplaceRequest(BaseModel):
     replacement_subject_id: str = Field(
         ...,
         min_length=1,
-        description="新受试者编号；必须未被占用（在册编号与已退役编号均不可复用）",
+        description=(
+            "新受试者编号；必须未被占用：在册编号与已退役编号均不可复用，"
+            "且原 / 新编号均不能被任何有效入组 reservation 占用"
+            "（被占用时须先释放相关入组锁再换号）"
+        ),
     )
     operation_id: str = Field(
         ...,
